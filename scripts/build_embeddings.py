@@ -1,103 +1,87 @@
-
-
 import os
 import re
-import sqlite3
 from datetime import datetime, timezone, timedelta
 from typing import List, Tuple
 
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-DB_PATH = "marketpulse.db"
+# NEW: Postgres via SQLAlchemy
+from sqlalchemy import text
+from db.conn import get_engine
+
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 # Tuning knobs
-LOOKBACK_DAYS = None            
-MAX_ARTICLES_PER_RUN = 1000    
+LOOKBACK_DAYS = None
+MAX_ARTICLES_PER_RUN = 1000
 
 # Chunking
-MAX_CHARS = 600               
-OVERLAP = 100                  
-INCLUDE_HEADLINE = True        
-HEADLINE_EVERY_CHUNK = False  
-
+MAX_CHARS = 600
+OVERLAP = 100
+INCLUDE_HEADLINE = True
+HEADLINE_EVERY_CHUNK = False
 MIN_CHUNK_LEN = 40
 
-
-def connect_db() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=5000;")
-    conn.execute("PRAGMA foreign_keys=ON;")
-    return conn
-
-
-def ensure_embeddings_table(conn: sqlite3.Connection):
-    conn.execute(
-        """
+def ensure_embeddings_table(engine):
+    """Creates the embeddings table if it doesn't exist."""
+    sql = text("""
         CREATE TABLE IF NOT EXISTS embeddings (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
-            article_id INTEGER NOT NULL,
+            id SERIAL PRIMARY KEY,
+            article_id INTEGER NOT NULL REFERENCES articles(id) ON DELETE CASCADE,
             chunk_id INTEGER NOT NULL,
-            vector BLOB NOT NULL,
+            vector BYTEA NOT NULL,
             dim INTEGER NOT NULL,
             text_snippet TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
-            FOREIGN KEY(article_id) REFERENCES articles(id) ON DELETE CASCADE
+            created_at TIMESTAMPTZ DEFAULT now()
         );
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS ix_embeddings_article ON embeddings(article_id);")
-    conn.execute("CREATE INDEX IF NOT EXISTS ix_embeddings_article_chunk ON embeddings(article_id, chunk_id);")
+    """)
+    idx1 = text("CREATE INDEX IF NOT EXISTS ix_embeddings_article ON embeddings(article_id);")
+    idx2 = text("CREATE INDEX IF NOT EXISTS ix_embeddings_article_chunk ON embeddings(article_id, chunk_id);")
+    with engine.begin() as c:
+        c.execute(sql)
+        c.execute(idx1)
+        c.execute(idx2)
 
-
-def select_articles_to_embed(
-    conn: sqlite3.Connection,
-    lookback_days: int | None = LOOKBACK_DAYS,
-    limit: int = MAX_ARTICLES_PER_RUN
-) -> List[Tuple[int, str, str, str]]:
+def select_articles_to_embed(engine, lookback_days=LOOKBACK_DAYS, limit=MAX_ARTICLES_PER_RUN) -> List[Tuple[int, str, str, str]]:
     """
     Returns rows: (article_id, headline, body, published_at).
-    Headline-only articles are allowed. We skip articles that already have any embeddings.
+    Skips articles that already have embeddings.
     """
-    clauses = ["NOT EXISTS (SELECT 1 FROM embeddings e WHERE e.article_id = a.id)"]
-    params: list = []
-
-    if lookback_days is not None:
-        clauses.append("datetime(a.published_at) >= datetime('now', ?)")
-        params.append(f"-{lookback_days} day")
-
-    where_sql = " AND ".join(clauses)
-
-    sql = f"""
+    sql = """
         SELECT a.id,
                COALESCE(NULLIF(TRIM(a.headline), ''), '') AS headline,
                COALESCE(NULLIF(TRIM(a.text), ''), '')     AS body,
                a.published_at
         FROM articles a
-        WHERE {where_sql}
-        ORDER BY a.published_at DESC, a.id DESC
-        LIMIT ?
+        WHERE NOT EXISTS (
+            SELECT 1 FROM embeddings e WHERE e.article_id = a.id
+        )
     """
-    params.append(limit)
-    return conn.execute(sql, params).fetchall()
+    params = {}
 
+    if lookback_days is not None:
+        sql += " AND a.published_at >= (now() - (:days || ' days')::interval) "
+        params["days"] = str(int(lookback_days))
+
+    sql += " ORDER BY a.published_at DESC, a.id DESC LIMIT :lim"
+    params["lim"] = int(limit)
+
+    with engine.connect() as c:
+        rows = c.execute(text(sql), params).all()
+    return rows
 
 # sentence boundary split
 _SENT_SPLIT = re.compile(r'(?<=[.!?])\s+(?=[A-Z0-9])')
-
 
 def chunk_text(headline: str, body: str) -> List[str]:
     """
     Split article text into chunks near MAX_CHARS, on sentence boundaries.
     Fallback to a headline-only chunk when the body is empty.
-    Optionally prepend headline to the first or all chunks.
     """
     headline = (headline or "").strip()
     text = (body or "").strip()
 
-    # Headline-only fallback when no body text exists
     if not text:
         return [headline] if headline else []
 
@@ -109,7 +93,6 @@ def chunk_text(headline: str, body: str) -> List[str]:
         s = s.strip()
         if not s:
             continue
-        # flush to a new chunk if adding s would exceed MAX_CHARS
         if current and (len(current) + 1 + len(s) > MAX_CHARS):
             chunks.append(current)
             if OVERLAP > 0 and len(current) > OVERLAP:
@@ -122,7 +105,6 @@ def chunk_text(headline: str, body: str) -> List[str]:
     if current:
         chunks.append(current)
 
-    # Prepend headline
     if INCLUDE_HEADLINE and headline and chunks:
         if HEADLINE_EVERY_CHUNK:
             chunks = [f"{headline} — {c}" for c in chunks]
@@ -134,44 +116,40 @@ def chunk_text(headline: str, body: str) -> List[str]:
 
     return chunks
 
-
-def insert_embeddings(conn: sqlite3.Connection, article_id: int, vectors: np.ndarray, snippets: List[str]):
+def insert_embeddings(engine, article_id: int, vectors: np.ndarray, snippets: List[str]):
     """
-    Insert each chunk embedding as a row in embeddings table.
+    Insert each chunk embedding into the embeddings table.
     """
-    conn.execute("BEGIN IMMEDIATE;")
-    try:
-        rows = [
-            (article_id, i, vec.astype(np.float32).tobytes(), int(vec.shape[0]), snippets[i])
-            for i, vec in enumerate(vectors)
-        ]
-        conn.executemany(
-            """
-            INSERT INTO embeddings (article_id, chunk_id, vector, dim, text_snippet)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            rows
-        )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
-
+    sql = text("""
+        INSERT INTO embeddings (article_id, chunk_id, vector, dim, text_snippet)
+        VALUES (:article_id, :chunk_id, :vector, :dim, :snippet)
+    """)
+    payload = [
+        {
+            "article_id": article_id,
+            "chunk_id": i,
+            "vector": vec.astype(np.float32).tobytes(),
+            "dim": int(vec.shape[0]),
+            "snippet": snippets[i]
+        }
+        for i, vec in enumerate(vectors)
+    ]
+    with engine.begin() as c:
+        c.execute(sql, payload)
 
 def main():
-    print("Connecting to DB...")
-    conn = connect_db()
-    ensure_embeddings_table(conn)
+    print("Connecting to DB…")
+    engine = get_engine()
+    ensure_embeddings_table(engine)
 
     print(f"Loading embedding model: {MODEL_NAME}")
     model = SentenceTransformer(MODEL_NAME)
     dim = model.get_sentence_embedding_dimension()
     print(f"Embedding dimension: {dim}")
 
-    to_embed = select_articles_to_embed(conn)
+    to_embed = select_articles_to_embed(engine)
     if not to_embed:
         print("No articles need embeddings. You are up to date.")
-        conn.close()
         return
 
     print(f"Found {len(to_embed)} articles to embed (lookback={LOOKBACK_DAYS}).")
@@ -185,7 +163,7 @@ def main():
 
         vectors = model.encode(
             chunks,
-            normalize_embeddings=True,        
+            normalize_embeddings=True,
             convert_to_numpy=True,
             batch_size=64,
             show_progress_bar=False
@@ -193,7 +171,7 @@ def main():
         if vectors.ndim == 1:
             vectors = vectors.reshape(1, -1)
 
-        insert_embeddings(conn, article_id, vectors, chunks)
+        insert_embeddings(engine, article_id, vectors, chunks)
 
         total_chunks += len(chunks)
         embedded_articles += 1
@@ -201,9 +179,7 @@ def main():
         if embedded_articles % 20 == 0:
             print(f"  Embedded {embedded_articles} articles, {total_chunks} chunks so far")
 
-    conn.close()
     print(f"Done. Embedded {embedded_articles} articles → {total_chunks} chunks.")
-
 
 if __name__ == "__main__":
     main()

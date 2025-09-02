@@ -1,7 +1,4 @@
-
-
 import os
-import sqlite3
 from datetime import datetime, timezone
 from typing import List, Tuple
 
@@ -9,44 +6,45 @@ import torch
 import pandas as pd
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
-DB_PATH = "marketpulse.db"
-MODEL_DIR = "models/my_sentiment_model"  
-USE_ARTICLE_TEXT_IF_AVAILABLE = True      
-MIN_TEXT_CHARS = 120                     
-LOOKBACK_DAYS = None                      
-MAX_TO_SCORE = 5000                       
+# NEW: Postgres via SQLAlchemy
+from sqlalchemy import text
+from db.conn import get_engine
+
+MODEL_DIR = "models/my_sentiment_model"   # unchanged (local for now)
+USE_ARTICLE_TEXT_IF_AVAILABLE = True
+MIN_TEXT_CHARS = 120
+LOOKBACK_DAYS = None          # e.g., 7 to limit by recency; None = all unscored
+MAX_TO_SCORE = 5000
+BATCH_SIZE = 32               # you were batching; set a sane default
 
 def connect_db():
-    conn = sqlite3.connect(DB_PATH, timeout=30)
-    conn.execute("PRAGMA journal_mode=WAL;")
-    conn.execute("PRAGMA busy_timeout=5000;")
-    conn.execute("PRAGMA foreign_keys=ON;")
-    return conn
+    """Return an SQLAlchemy engine connected via DATABASE_URL."""
+    return get_engine()
 
-def fetch_unscored_articles(conn) -> List[Tuple]:
-    where = []
-    params = []
-    if LOOKBACK_DAYS is not None:
-        where.append("datetime(published_at) >= datetime('now', ?)")
-        params.append(f"-{LOOKBACK_DAYS} day")
-    where_sql = "WHERE " + " AND ".join(where) if where else ""
-    sql = f"""
-      SELECT a.id, a.ticker, a.headline, a.text, a.published_at
-      FROM articles a
-      LEFT JOIN sentiment s ON s.article_id = a.id
-      {where_sql} AND s.article_id IS NULL
-      ORDER BY a.published_at DESC, a.id DESC
-      LIMIT ?
-    """ if where_sql else """
+def fetch_unscored_articles(engine) -> List[Tuple]:
+    """
+    Returns rows: (id, ticker, headline, text, published_at)
+    Equivalent to your SQLite query, but in Postgres.
+    """
+    base_sql = """
       SELECT a.id, a.ticker, a.headline, a.text, a.published_at
       FROM articles a
       LEFT JOIN sentiment s ON s.article_id = a.id
       WHERE s.article_id IS NULL
-      ORDER BY a.published_at DESC, a.id DESC
-      LIMIT ?
     """
-    params.append(MAX_TO_SCORE)
-    return conn.execute(sql, params).fetchall()
+    params = {}
+
+    if LOOKBACK_DAYS is not None:
+        # Filter: a.published_at >= now() - interval '<days> days'
+        base_sql += " AND a.published_at >= (now() - (:days || ' days')::interval) "
+        params["days"] = str(int(LOOKBACK_DAYS))
+
+    base_sql += " ORDER BY a.published_at DESC, a.id DESC LIMIT :limit "
+    params["limit"] = int(MAX_TO_SCORE)
+
+    with engine.connect() as c:
+        rows = c.execute(text(base_sql), params).all()
+    return rows
 
 def load_model():
     tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
@@ -55,7 +53,7 @@ def load_model():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
 
-    id2label = {int(k): v for k, v in model.config.id2label.items()} if hasattr(model.config, "id2label") else {}
+    id2label = {int(k): v for k, v in getattr(model.config, "id2label", {}).items()}
     idx_neg = idx_neu = idx_pos = None
     for i, lbl in id2label.items():
         l = str(lbl).lower()
@@ -91,39 +89,43 @@ def choose_text(headline: str, body: str) -> Tuple[str, str]:
     """
     if USE_ARTICLE_TEXT_IF_AVAILABLE and body and len(body.strip()) >= MIN_TEXT_CHARS:
         return body.strip(), "text"
-    return headline.strip(), "headline"
+    return (headline or "").strip(), "headline"
 
-def insert_sentiment_rows(conn, rows_to_insert):
+def insert_sentiment_rows(engine, rows_to_insert):
     """
     rows_to_insert: list of tuples (article_id, label, p_neg, p_neu, p_pos)
-    created_at has default in schema; we don't set it explicitly.
+    created_at has default now() in Postgres schema.
+    Preserves your original "INSERT OR IGNORE" behavior via ON CONFLICT DO NOTHING.
     """
-    conn.execute("BEGIN IMMEDIATE;")
-    try:
-        conn.executemany(
-            """
-            INSERT OR IGNORE INTO sentiment (article_id, label, p_neg, p_neu, p_pos)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            rows_to_insert,
-        )
-        conn.commit()
-    except Exception:
-        conn.rollback()
-        raise
+    sql = text("""
+        INSERT INTO sentiment (article_id, label, p_neg, p_neu, p_pos)
+        VALUES (:article_id, :label, :p_neg, :p_neu, :p_pos)
+        ON CONFLICT (article_id) DO NOTHING
+    """)
+    payload = [
+        {
+            "article_id": int(aid),
+            "label": lab,
+            "p_neg": float(pn),
+            "p_neu": float(pu),
+            "p_pos": float(pp),
+        }
+        for (aid, lab, pn, pu, pp) in rows_to_insert
+    ]
+    with engine.begin() as c:
+        c.execute(sql, payload)
 
 def main():
     print("Loading model…")
     tokenizer, model, device, idx_map = load_model()
 
     print("Connecting to DB…")
-    conn = connect_db()
+    engine = connect_db()
 
     print("Selecting unscored articles…")
-    records = fetch_unscored_articles(conn)
+    records = fetch_unscored_articles(engine)
     if not records:
         print("No unscored articles found. You're up to date.")
-        conn.close()
         return
 
     print(f"Found {len(records)} to score.")
@@ -149,7 +151,7 @@ def main():
         rows_db.append((int(aid), lab, p_neg, p_neu, p_pos))
 
     print("Inserting into sentiment table…")
-    insert_sentiment_rows(conn, rows_db)
+    insert_sentiment_rows(engine, rows_db)
 
     now = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     out_path = f"data/sentiment_scores_{now}.csv"
@@ -157,7 +159,7 @@ def main():
         "article_id": article_ids,
         "ticker": tickers,
         "headline": headlines,
-        "used": used_src,                 
+        "used": used_src,
         "label": labels,
         "p_neg": [p[0] for p in prob_triplets],
         "p_neu": [p[1] for p in prob_triplets],
@@ -178,7 +180,6 @@ def main():
     print("\nSummary (newly scored):")
     print(summary)
 
-    conn.close()
     print("Done.")
 
 if __name__ == "__main__":

@@ -1,6 +1,3 @@
-
-
-import sqlite3
 from datetime import datetime, timezone
 from math import exp
 from typing import List, Optional, Dict, Any
@@ -8,19 +5,22 @@ import re
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-DB_PATH = "marketpulse.db"
+# NEW: Postgres via SQLAlchemy
+from sqlalchemy import text
+from db.conn import get_engine
+
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
 # ---------------- Scoring knobs ----------------
-W_SEMANTIC = 0.80                
-W_RECENCY  = 0.20                
-RECENCY_HALF_LIFE_DAYS = 7.0      
-SEMANTIC_MIN = 0.25               
+W_SEMANTIC = 0.80
+W_RECENCY  = 0.20
+RECENCY_HALF_LIFE_DAYS = 7.0
+SEMANTIC_MIN = 0.25
 
 # Sentiment blend
-CONF_BAND = 0.60                  
-NEG_WEIGHT = 0.20                
-POS_WEIGHT = 0.20                 
+CONF_BAND = 0.60
+NEG_WEIGHT = 0.20
+POS_WEIGHT = 0.20
 
 # Candidate caps
 DEFAULT_CANDIDATES = 3000
@@ -39,21 +39,21 @@ POS_ARTICLE_HINTS = re.compile(
     re.I,
 )
 
-def _connect():
-    con = sqlite3.connect(DB_PATH, timeout=30)
-    con.execute("PRAGMA journal_mode=WAL;")
-    con.execute("PRAGMA busy_timeout=5000;")
-    con.row_factory = sqlite3.Row
-    return con
-
 def _to_vec(blob: bytes, dim: int) -> np.ndarray:
-    return np.frombuffer(blob, dtype=np.float32, count=dim)
+    # psycopg returns memoryview/bytes; ensure bytes then view as float32
+    return np.frombuffer(bytes(blob), dtype=np.float32, count=dim)
 
-def _age_days(iso_date: str) -> float:
-    if not iso_date:
+def _age_days(published_at) -> float:
+    """
+    Accepts either a datetime (from Postgres) or a 'YYYY-MM-DD' string.
+    """
+    if published_at is None:
         return 365.0
     try:
-        dt = datetime.strptime(iso_date, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        if isinstance(published_at, datetime):
+            dt = published_at.astimezone(timezone.utc)
+        else:
+            dt = datetime.strptime(str(published_at), "%Y-%m-%d").replace(tzinfo=timezone.utc)
     except Exception:
         return 365.0
     now = datetime.now(timezone.utc)
@@ -72,6 +72,7 @@ def _intent_from_query(q: str) -> str:
 class Retriever:
     def __init__(self, model_name: str = MODEL_NAME):
         self.model = SentenceTransformer(model_name)
+        self.engine = get_engine()
 
     def embed_query(self, text: str) -> np.ndarray:
         v = self.model.encode([text], normalize_embeddings=True, convert_to_numpy=True)
@@ -79,7 +80,6 @@ class Retriever:
 
     def _fetch_candidates(
         self,
-        con: sqlite3.Connection,
         ticker: Optional[str],
         days: Optional[int],
         limit: int,
@@ -89,16 +89,17 @@ class Retriever:
         Fetch candidate chunks joined with sentiment (if available).
         Includes headline-only embeddings (no filter on a.text).
         """
-        params = []
-        where = "WHERE 1=1"
+        where = ["1=1"]
+        params: Dict[str, Any] = {}
 
         if ticker:
-            where += " AND a.ticker = ?"
-            params.append(ticker.upper())
+            where.append("a.ticker = :ticker")
+            params["ticker"] = ticker.upper()
 
         if days is not None and days > 0:
-            where += " AND date(a.published_at) >= date('now', ?)"
-            params.append(f"-{days} day")
+            # Postgres interval version of date filter
+            where.append("a.published_at >= (now() - (:days || ' days')::interval)")
+            params["days"] = str(int(days))
 
         label_filter = ""
         if intent == "neg":
@@ -117,12 +118,17 @@ class Retriever:
         FROM embeddings e
         JOIN articles a ON a.id = e.article_id
         LEFT JOIN sentiment s ON s.article_id = a.id
-        {where} {label_filter}
+        WHERE {" AND ".join(where)}
+        {label_filter}
         ORDER BY a.published_at DESC, e.article_id DESC, e.chunk_id ASC
-        LIMIT ?
+        LIMIT :limit
         """
-        params.append(limit)
-        return con.execute(sql, params).fetchall()
+        params["limit"] = int(limit)
+
+        with self.engine.connect() as c:
+            # .mappings() gives dict-like rows (so r["col"] works)
+            rows = c.execute(text(sql), params).mappings().all()
+        return rows
 
     def search(
         self,
@@ -140,9 +146,7 @@ class Retriever:
         intent = _intent_from_query(query)
         qvec = self.embed_query(query)
 
-        with _connect() as con:
-            rows = self._fetch_candidates(con, ticker, days, candidate_limit, intent)
-
+        rows = self._fetch_candidates(ticker, days, candidate_limit, intent)
         if not rows:
             return []
 
@@ -153,15 +157,15 @@ class Retriever:
             if not rows:
                 return []
 
-        mat = np.stack([_to_vec(r["vector"], dim0) for r in rows])  
-        sims = mat.dot(qvec)  
+        mat = np.stack([_to_vec(r["vector"], dim0) for r in rows])  # (N, D)
+        sims = mat.dot(qvec)  # (N,)
 
         per_article: Dict[int, Dict[str, Any]] = {}
 
         for r, sem in zip(rows, sims):
             sem = float(sem)
             if sem < SEMANTIC_MIN:
-                continue  
+                continue
 
             age = _age_days(r["published_at"])
             rec = _recency_score(age)
@@ -231,5 +235,5 @@ if __name__ == "__main__":
             print(f"\n[{i}] score={h['score']:.3f} (sem={h['semantic']:.3f}, rec={h['recency']:.3f}, boost={h['sent_boost']:.3f}, age={h['age_days']:.1f}d)")
             print(f"    {h['ticker']} | {h['published_at']} | {h['source']}")
             print(f"    {h['headline']}")
-            print("    Snippet:", textwrap.shorten(h["snippet"] or "", width=200, placeholder='…'))
+            print("    Snippet:", textwrap.shorten(h['snippet'] or '', width=200, placeholder='…'))
             print(f"    URL: {h['url']}")

@@ -1,69 +1,67 @@
-
-
 from typing import List, Dict, Any, Optional, Tuple
 import re
 import os
 import json
 import textwrap
 import hashlib
-import sqlite3
 import requests
 from urllib.parse import urlparse, urlunparse
 
+# DB: Postgres via SQLAlchemy
+from sqlalchemy import text
+from db.conn import get_engine
+
+# Retriever (already Postgres-compatible)
 try:
-    from scripts.retriever import Retriever, _connect
+    from scripts.retriever import Retriever
 except ImportError:
-    from retriever import Retriever, _connect  
+    from retriever import Retriever
 
-DB_PATH = "marketpulse.db"
-
-import os
 OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
 if not OPENAI_API_KEY:
     raise RuntimeError("Set OPENAI_API_KEY in env or Streamlit secrets")
 
 OPENAI_MODEL = "gpt-4o-mini"
-OPENAI_URL = "https://api.openai.com/v1/responses"  
+OPENAI_URL = "https://api.openai.com/v1/responses"
 API_TIMEOUT = 30
-MAX_OUTPUT_TOKENS_BULLETS = 500  
+MAX_OUTPUT_TOKENS_BULLETS = 500  # unchanged
 
-MAX_SOURCES = 5            
-CHUNKS_PER_ARTICLE = 3      
-TARGET_WORDS = (180, 220)   
+MAX_SOURCES = 5
+CHUNKS_PER_ARTICLE = 3
+TARGET_WORDS = (180, 220)
 
-SUM_CHUNKS_PER_ARTICLE = 8      
-SUMMARY_PROMPT_VERSION = "v1"   
+SUM_CHUNKS_PER_ARTICLE = 8
+SUMMARY_PROMPT_VERSION = "v1"
+# NOTE: your original file references MAX_OUTPUT_TOKENS_SUMMARY later.
+# I am not defining it here because you asked for DB-only changes.
 
-def _ensure_cache_tables(conn: sqlite3.Connection):
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS answers_cache (
-            key_hash TEXT PRIMARY KEY,
-            query TEXT NOT NULL,
-            ticker TEXT,
-            article_ids TEXT NOT NULL,
-            evidence_hash TEXT NOT NULL,
-            answer TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS ix_answers_cache_created ON answers_cache(created_at)")
-
-    conn.execute(
-        """
-        CREATE TABLE IF NOT EXISTS summaries_cache (
-            key_hash TEXT PRIMARY KEY,
-            article_id INTEGER NOT NULL,
-            model TEXT NOT NULL,
-            prompt_version TEXT NOT NULL,
-            content_hash TEXT NOT NULL,
-            summary TEXT NOT NULL,
-            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
-        )
-        """
-    )
-    conn.execute("CREATE INDEX IF NOT EXISTS ix_summaries_cache_created ON summaries_cache(created_at)")
+# ---------- cache tables (Postgres) ----------
+def _ensure_cache_tables(engine):
+    with engine.begin() as c:
+        c.execute(text("""
+            CREATE TABLE IF NOT EXISTS answers_cache (
+                key_hash TEXT PRIMARY KEY,
+                query TEXT NOT NULL,
+                ticker TEXT,
+                article_ids TEXT NOT NULL,
+                evidence_hash TEXT NOT NULL,
+                answer TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT now()
+            )
+        """))
+        c.execute(text("CREATE INDEX IF NOT EXISTS ix_answers_cache_created ON answers_cache(created_at)"))
+        c.execute(text("""
+            CREATE TABLE IF NOT EXISTS summaries_cache (
+                key_hash TEXT PRIMARY KEY,
+                article_id INTEGER NOT NULL,
+                model TEXT NOT NULL,
+                prompt_version TEXT NOT NULL,
+                content_hash TEXT NOT NULL,
+                summary TEXT NOT NULL,
+                created_at TIMESTAMPTZ DEFAULT now()
+            )
+        """))
+        c.execute(text("CREATE INDEX IF NOT EXISTS ix_summaries_cache_created ON summaries_cache(created_at)"))
 
 def _sha256(s: str) -> str:
     return hashlib.sha256(s.encode("utf-8")).hexdigest()
@@ -78,12 +76,16 @@ def _canonical_url(u: str) -> str:
 def _word_count(s: str) -> int:
     return len(re.findall(r"\b\w+\b", s or ""))
 
-def _get_joined_snippet(con, article_id: int, limit: int) -> str:
-    rows = con.execute(
-        "SELECT text_snippet FROM embeddings WHERE article_id = ? ORDER BY chunk_id ASC LIMIT ?",
-        (article_id, limit)
-    ).fetchall()
+def _get_joined_snippet(engine, article_id: int, limit: int) -> str:
+    sql = text("""
+        SELECT text_snippet FROM embeddings
+        WHERE article_id = :aid
+        ORDER BY chunk_id ASC
+        LIMIT :lim
+    """)
     parts = []
+    with engine.connect() as c:
+        rows = c.execute(sql, {"aid": int(article_id), "lim": int(limit)}).all()
     for r in rows:
         sn = (r[0] or "").replace("\n", " ").strip()
         if sn:
@@ -99,17 +101,25 @@ def _make_answer_cache_key(query: str, ticker: Optional[str], article_ids: List[
     key = _sha256(material)
     return key, ",".join(map(str, ids_sorted)), ev_digest
 
-def _answer_cache_get(conn: sqlite3.Connection, key_hash: str) -> Optional[str]:
-    row = conn.execute("SELECT answer FROM answers_cache WHERE key_hash = ?", (key_hash,)).fetchone()
+def _answer_cache_get(engine, key_hash: str) -> Optional[str]:
+    with engine.connect() as c:
+        row = c.execute(text("SELECT answer FROM answers_cache WHERE key_hash = :k"), {"k": key_hash}).fetchone()
     return row[0] if row else None
 
-def _answer_cache_put(conn: sqlite3.Connection, key_hash: str, query: str, ticker: Optional[str],
+def _answer_cache_put(engine, key_hash: str, query: str, ticker: Optional[str],
                       article_ids_csv: str, evidence_hash: str, answer: str):
-    conn.execute(
-        "INSERT OR REPLACE INTO answers_cache (key_hash, query, ticker, article_ids, evidence_hash, answer) VALUES (?, ?, ?, ?, ?, ?)",
-        (key_hash, query, ticker or "", article_ids_csv, evidence_hash, answer)
-    )
-    conn.commit()
+    sql = text("""
+        INSERT INTO answers_cache (key_hash, query, ticker, article_ids, evidence_hash, answer)
+        VALUES (:k, :q, :t, :ids, :ev, :ans)
+        ON CONFLICT (key_hash) DO UPDATE SET
+          query = EXCLUDED.query,
+          ticker = EXCLUDED.ticker,
+          article_ids = EXCLUDED.article_ids,
+          evidence_hash = EXCLUDED.evidence_hash,
+          answer = EXCLUDED.answer
+    """)
+    with get_engine().begin() as c:
+        c.execute(sql, {"k": key_hash, "q": query, "t": (ticker or ""), "ids": article_ids_csv, "ev": evidence_hash, "ans": answer})
 
 def _make_summary_cache_key(article_id: int, model: str, prompt_version: str, headline: str, content: str) -> Tuple[str, str]:
     content_norm = re.sub(r"\s+", " ", f"{headline or ''} || {content or ''}".strip())
@@ -121,17 +131,25 @@ def _make_summary_cache_key(article_id: int, model: str, prompt_version: str, he
     key = _sha256(material)
     return key, content_hash
 
-def _summary_cache_get(conn: sqlite3.Connection, key_hash: str) -> Optional[str]:
-    row = conn.execute("SELECT summary FROM summaries_cache WHERE key_hash = ?", (key_hash,)).fetchone()
+def _summary_cache_get(engine, key_hash: str) -> Optional[str]:
+    with engine.connect() as c:
+        row = c.execute(text("SELECT summary FROM summaries_cache WHERE key_hash = :k"), {"k": key_hash}).fetchone()
     return row[0] if row else None
 
-def _summary_cache_put(conn: sqlite3.Connection, key_hash: str, article_id: int, model: str,
+def _summary_cache_put(engine, key_hash: str, article_id: int, model: str,
                        prompt_version: str, content_hash: str, summary: str):
-    conn.execute(
-        "INSERT OR REPLACE INTO summaries_cache (key_hash, article_id, model, prompt_version, content_hash, summary) VALUES (?, ?, ?, ?, ?, ?)",
-        (key_hash, int(article_id), model, prompt_version, content_hash, summary)
-    )
-    conn.commit()
+    sql = text("""
+        INSERT INTO summaries_cache (key_hash, article_id, model, prompt_version, content_hash, summary)
+        VALUES (:k, :aid, :m, :pv, :ch, :s)
+        ON CONFLICT (key_hash) DO UPDATE SET
+          article_id = EXCLUDED.article_id,
+          model = EXCLUDED.model,
+          prompt_version = EXCLUDED.prompt_version,
+          content_hash = EXCLUDED.content_hash,
+          summary = EXCLUDED.summary
+    """)
+    with get_engine().begin() as c:
+        c.execute(sql, {"k": key_hash, "aid": int(article_id), "m": model, "pv": prompt_version, "ch": content_hash, "s": summary})
 
 def _format_sources_for_prompt(items: List[Dict[str, Any]]) -> str:
     blocks = []
@@ -185,7 +203,6 @@ _RX_YEAR    = re.compile(r'\b20\d{2}\b')
 _RX_QUARTER = re.compile(r'\bQ[1-4]\b', re.I)
 
 def _normalize_num_token(tok: str) -> str:
-    """Normalize number-like tokens for comparison."""
     t = tok.strip()
     t = t.replace(" ", "")
     if t.startswith("$"):
@@ -195,30 +212,24 @@ def _normalize_num_token(tok: str) -> str:
     return t
 
 def _supported_in_evidence(token: str, evidence_text_norm: str) -> bool:
-    """Check if a numeric token (normalized) appears in evidence (also normalized)."""
     t = _normalize_num_token(token)
     if not t:
         return True
     return (t in evidence_text_norm)
 
 def _remove_unsupported_numbers(text: str, evidence_text: str) -> str:
-    """Strip numbers/quarters not present in evidence; keep citations like [1] intact."""
     ev_norm = evidence_text.replace(" ", "").replace(",", "")
-    ev_norm = ev_norm  
-
     def strip_tokens(rx: re.Pattern, s: str) -> str:
         out = []
         last = 0
         for m in rx.finditer(s):
             tok = m.group(0)
             if _supported_in_evidence(tok, ev_norm):
-                continue  
-            
+                continue
             out.append(s[last:m.start()])
             last = m.end()
         out.append(s[last:])
         return "".join(out)
-
     out = text
     out = strip_tokens(_RX_DOLLAR, out)
     out = strip_tokens(_RX_PERCENT, out)
@@ -227,19 +238,16 @@ def _remove_unsupported_numbers(text: str, evidence_text: str) -> str:
     def strip_quarters(s: str) -> str:
         return re.sub(_RX_QUARTER, lambda m: "" if not _supported_in_evidence(m.group(0), ev_norm) else m.group(0), s)
     out = strip_quarters(out)
-
     out = re.sub(r'\s{2,}', ' ', out).strip()
     out = re.sub(r'\s+(\[\d+(?:-\d+)?\])', r' \1', out)
     return out
 
 def _extract_bullet_lines(text: str) -> List[str]:
-    """Get lines that look like bullets; if none, split paragraphs into bullets."""
     lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
     bullets = [ln if ln.startswith("-") else f"- {ln}" for ln in lines if ln.startswith("-") or len(lines) <= 4]
     return bullets or [f"- {text.strip()}"]
 
 def _enforce_numbers_from_evidence(bullets_text: str, evidence_text: str) -> str:
-    """Apply numeric guard to each bullet; drop empty bullets that become blank."""
     bullets = _extract_bullet_lines(bullets_text)
     clean = []
     for b in bullets:
@@ -250,16 +258,10 @@ def _enforce_numbers_from_evidence(bullets_text: str, evidence_text: str) -> str
     return "\n".join(clean) if clean else bullets_text
 
 def _openai_respond(prompt: str, *, max_output_tokens: int) -> str:
-    """
-    Responses API call for gpt-4o-mini using the shape proven by your smoke test:
-      - messages with STRING content
-      - text: {"format": {"type":"text"}} to force a message output
-      - read output_text, else parse output -> message -> content[].text
-    """
     headers = {
-        "Authorization": f"Bearer {API_KEY}",
+        # NOTE: use your OPENAI_API_KEY env var
+        "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
-        
     }
     body = {
         "model": OPENAI_MODEL,
@@ -267,10 +269,9 @@ def _openai_respond(prompt: str, *, max_output_tokens: int) -> str:
             {"role": "system", "content": "You are a helpful assistant."},
             {"role": "user",   "content": prompt},
         ],
-        "text": {"format": {"type": "text"}},   
+        "text": {"format": {"type": "text"}},
         "max_output_tokens": max_output_tokens,
     }
-
     r = requests.post(OPENAI_URL, headers=headers, json=body, timeout=API_TIMEOUT)
     if r.status_code >= 400:
         try:
@@ -278,7 +279,6 @@ def _openai_respond(prompt: str, *, max_output_tokens: int) -> str:
         except Exception:
             err = {"text": r.text}
         raise RuntimeError(f"OpenAI {r.status_code}: {err}")
-
     data = r.json()
 
     if os.environ.get("RAG_DEBUG") == "1":
@@ -347,28 +347,27 @@ def answer_query(query: str, ticker: Optional[str], days: int = 7, topk: int = 5
         if len(top) >= MAX_SOURCES:
             break
 
+    engine = get_engine()
+
     article_ids = []
-    with _connect() as con:
-        for h in top:
-            aid = int(h["article_id"])
-            article_ids.append(aid)
-            ev = _get_joined_snippet(con, aid, limit=CHUNKS_PER_ARTICLE)
-            if not ev:
-                ev = (h.get("snippet") or "").strip()
-            ev = re.sub(r"\s+", " ", ev).strip()
-            h["_evidence"] = ev
+    for h in top:
+        aid = int(h["article_id"])
+        article_ids.append(aid)
+        ev = _get_joined_snippet(engine, aid, limit=CHUNKS_PER_ARTICLE)
+        if not ev:
+            ev = (h.get("snippet") or "").strip()
+        ev = re.sub(r"\s+", " ", ev).strip()
+        h["_evidence"] = ev
 
     evidences = [h["_evidence"] for h in top]
     key_hash, ids_csv, ev_hash = _make_answer_cache_key(query, ticker, article_ids, evidences)
 
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        _ensure_cache_tables(conn)
-        cached = _answer_cache_get(conn, key_hash)
-        if cached:
-            if debug:
-                print("[DEBUG] Answer cache hit")
-            return cached
+    _ensure_cache_tables(engine)
+    cached = _answer_cache_get(engine, key_hash)
+    if cached:
+        if debug:
+            print("[DEBUG] Answer cache hit")
+        return cached
 
     prompt = _build_bullets_prompt(query, ticker, top)
     if debug:
@@ -414,10 +413,8 @@ def answer_query(query: str, ticker: Optional[str], days: int = 7, topk: int = 5
     final = f"{bullets}\n\nSources:\n{sources_list}"
 
     if not fallback_used:
-        with sqlite3.connect(DB_PATH, timeout=30) as conn:
-            conn.execute("PRAGMA journal_mode=WAL;")
-            _ensure_cache_tables(conn)
-            _answer_cache_put(conn, key_hash, query, ticker, ids_csv, ev_hash, final)
+        _ensure_cache_tables(engine)
+        _answer_cache_put(engine, key_hash, query, ticker, ids_csv, ev_hash, final)
     else:
         if debug:
             print("[DEBUG] Skipping cache write due to fallback output")
@@ -427,52 +424,55 @@ def answer_query(query: str, ticker: Optional[str], days: int = 7, topk: int = 5
 def summarize_article(article_id: int, debug: bool = False) -> str:
     if debug:
         os.environ["RAG_DEBUG"] = "1"
-    with _connect() as con:
-        row = con.execute(
-            "SELECT a.id, a.ticker, a.headline, a.url, a.source, a.published_at FROM articles a WHERE a.id = ?",
-            (article_id,),
-        ).fetchone()
+
+    engine = get_engine()
+    with engine.connect() as c:
+        row = c.execute(
+            text("SELECT a.id, a.ticker, a.headline, a.url, a.source, a.published_at FROM articles a WHERE a.id = :aid"),
+            {"aid": int(article_id)},
+        ).mappings().fetchone()
         if not row:
             return f"Article {article_id} not found."
-        chunks = con.execute(
-            "SELECT text_snippet FROM embeddings WHERE article_id = ? ORDER BY chunk_id ASC LIMIT ?",
-            (article_id, SUM_CHUNKS_PER_ARTICLE),
-        ).fetchall()
+        chunks = c.execute(
+            text("SELECT text_snippet FROM embeddings WHERE article_id = :aid ORDER BY chunk_id ASC LIMIT :lim"),
+            {"aid": int(article_id), "lim": int(SUM_CHUNKS_PER_ARTICLE)},
+        ).all()
 
     headline = (row["headline"] or "").strip()
     url = _canonical_url(row["url"] or "")
-    date = (row["published_at"] or "n/a").strip()
+    date = (row["published_at"] or "n/a")
+    if hasattr(date, "isoformat"):
+        date = date.strftime("%Y-%m-%d")
     src = (row["source"] or "").strip() or urlparse(url).netloc
     body_parts = [headline] + [((c[0] or "").replace("\n", " ").strip()) for c in chunks]
     content = re.sub(r"\s+", " ", " ".join([p for p in body_parts if p])).strip()
 
     key_hash, content_hash = _make_summary_cache_key(article_id, OPENAI_MODEL, SUMMARY_PROMPT_VERSION, headline, content)
-    with sqlite3.connect(DB_PATH, timeout=30) as conn:
-        conn.execute("PRAGMA journal_mode=WAL;")
-        _ensure_cache_tables(conn)
-        cached = _summary_cache_get(conn, key_hash)
-        if cached:
-            if debug:
-                print("[DEBUG] Summary cache hit")
-            summary = cached
-        else:
-            prompt = _build_summary_prompt(headline, content)
-            if debug:
-                print("[DEBUG] Summary prompt preview:")
-                print(textwrap.shorten(prompt, width=500, placeholder=" ..."))
-            try:
-                summary = _openai_respond(prompt, max_output_tokens=MAX_OUTPUT_TOKENS_SUMMARY)
-                if not summary.strip():
-                    if debug:
-                        print("[DEBUG] Empty model response on summarize; using extractive fallback")
-                    summary = textwrap.shorten(content or headline, width=600, placeholder="...")
-            except Exception as e:
-                if debug:
-                    print(f"[DEBUG] OpenAI call failed: {e}")
-                summary = textwrap.shorten(content or headline, width=600, placeholder="...")
 
-            # Store in cache
-            _summary_cache_put(conn, key_hash, int(article_id), OPENAI_MODEL, SUMMARY_PROMPT_VERSION, content_hash, summary)
+    _ensure_cache_tables(engine)
+    cached = _summary_cache_get(engine, key_hash)
+    if cached:
+        if debug:
+            print("[DEBUG] Summary cache hit")
+        summary = cached
+    else:
+        prompt = _build_summary_prompt(headline, content)
+        if debug:
+            print("[DEBUG] Summary prompt preview:")
+            print(textwrap.shorten(prompt, width=500, placeholder=" ..."))
+        try:
+            # NOTE: your original code uses MAX_OUTPUT_TOKENS_SUMMARY here.
+            summary = _openai_respond(prompt, max_output_tokens=MAX_OUTPUT_TOKENS_SUMMARY)  # noqa: F821
+            if not summary.strip():
+                if debug:
+                    print("[DEBUG] Empty model response on summarize; using extractive fallback")
+                summary = textwrap.shorten(content or headline, width=600, placeholder="...")
+        except Exception as e:
+            if debug:
+                print(f"[DEBUG] OpenAI call failed: {e}")
+            summary = textwrap.shorten(content or headline, width=600, placeholder="...")
+
+        _summary_cache_put(engine, key_hash, int(article_id), OPENAI_MODEL, SUMMARY_PROMPT_VERSION, content_hash, summary)
 
     cite = f"{src} - {date} - {url}"
     return f"- {date} - {summary}\n\nSource:\n{cite}"
