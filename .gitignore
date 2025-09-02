@@ -1,13 +1,61 @@
+# --- Virtual environments ---
 .venv/
+env/
+venv/
+ENV/
+
+# --- Environment & secrets ---
 .env
-__pycache__/
-.ipynb_checkpoints/
-marketpulse.db
+*.env
 apikey.txt
+.streamlit/secrets.toml
+
+# --- Python caches ---
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+*.log
+
+# --- Local databases ---
+marketpulse.db
+*.sqlite
+*.sqlite3
+
+# --- Data files ---
 data/*.csv
+data/*.json
+data/*.parquet
+
+# --- Model files ---
 models/
 *.bin
 *.pt
 *.onnx
 *.pkl
 *.pickle
+
+# --- Jupyter & notebooks ---
+.ipynb_checkpoints/
+
+# --- OS-specific files ---
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# --- IDE / Editor files ---
+.vscode/
+.idea/
+*.code-workspace
+
+# --- Node / Frontend (if any) ---
+node_modules/
+dist/
+build/
+
+# --- Streamlit ---
+.streamlit/
+
+# --- Hugging Face cache (if used) ---
+.cache/
+huggingface/
