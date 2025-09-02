@@ -1,7 +1,4 @@
-
-
 import time
-import sqlite3
 from collections import defaultdict
 from datetime import datetime, timezone, timedelta
 from urllib.parse import urlparse, urlunparse
@@ -13,7 +10,9 @@ from urllib3.util.retry import Retry
 import feedparser
 import pandas as pd
 
-DB_PATH = "marketpulse.db"
+# NEW: use SQLAlchemy + your shared connector
+from sqlalchemy import text
+from db.conn import get_engine
 
 # ---------------- General publisher feeds ----------------
 FINANCIAL_RSS_FEEDS = {
@@ -105,7 +104,6 @@ def canonical_url(u: str) -> str:
         return u
 
 # ---------------- Company dictionaries ----------------
-# ---------------- Company dictionaries ----------------
 COMPANY_PRIMARY = {
     "AAPL": "Apple",
     "MSFT": "Microsoft",
@@ -120,8 +118,6 @@ COMPANY_PRIMARY = {
     "GS":  "Goldman Sachs",
     "AVGO": "Broadcom",
     "TSM": "TSMC",
-
-    # New additions
     "WMT": "Walmart",
     "ORCL": "Oracle",
     "NFLX": "Netflix",
@@ -146,8 +142,6 @@ COMPANY_ALIASES = {
     "GS":  ["Goldman Sachs Group", "Goldman", "Marcus"],
     "AVGO": ["Broadcom Inc", "VMware", "VMW"],
     "TSM": ["Taiwan Semiconductor", "Taiwan Semi", "TSMC"],
-
-    # New additions
     "WMT": ["Walmart Inc", "Sam's Club", "Walmart U.S.", "Walmart International"],
     "ORCL": ["Oracle Corp", "Oracle Corporation", "OCI", "Cerner", "MySQL HeatWave", "Fusion Cloud"],
     "NFLX": ["Netflix Inc", "ad-supported tier", "password sharing crackdown"],
@@ -158,26 +152,15 @@ COMPANY_ALIASES = {
     "BA":  ["Boeing Co", "737 MAX", "787 Dreamliner", "777X", "Boeing Commercial Airplanes"],
 }
 
-
 # ---------------- Per-symbol feeds ----------------
 def per_symbol_feed_urls(ticker: str):
     t = ticker.upper()
     urls = []
-
-    # Yahoo Finance per symbol
     urls.append(f"https://feeds.finance.yahoo.com/rss/2.0/headline?s={t}&region=US&lang=en-US")
-
-    # Seeking Alpha per symbol 
     urls.append(f"https://seekingalpha.com/api/sa/combined/{t}.xml")
-
-    # Motley Fool per ticker
     urls.append(f"https://www.fool.com/feeds/index.aspx?ticker={t}")
-
-    # MarketBeat per ticker 
     urls.append(f"https://www.marketbeat.com/stocks/NASDAQ/{t}/feed/")
-    urls.append(f"https://www.marketbeat.com/stocks/NYSE/{t}/feed/")  # try both in case of listing
-
-
+    urls.append(f"https://www.marketbeat.com/stocks/NYSE/{t}/feed/")
     return urls
 
 # ---------------- Scoring ----------------
@@ -275,7 +258,6 @@ def fetch_ticker_specific_feeds(ticker: str, debug=False):
             feed = feedparser.parse(url)
             if debug:
                 print(f"[{ticker}] per-symbol feed {url} entries={len(feed.entries)}")
-            # modest cap per feed to avoid flooding
             for e in feed.entries[:30]:
                 title = (e.get("title") or "").strip()
                 link  = (e.get("link")  or "").strip()
@@ -343,24 +325,65 @@ def select_per_ticker(candidates, debug=False):
 
     return selected
 
-def upsert_articles(df: pd.DataFrame, db_path=DB_PATH) -> int:
-    with sqlite3.connect(db_path) as conn:
-        conn.execute("PRAGMA foreign_keys = ON")
-        before = conn.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
-        rows = [
-            (r.ticker, r.headline, r.url, r.published_at, r.source, r.text)
-            for r in df.itertuples(index=False)
-        ]
-        conn.executemany(
-            """
-            INSERT OR IGNORE INTO articles
-            (ticker, headline, url, published_at, source, text)
-            VALUES (?, ?, ?, ?, ?, ?)
-            """,
-            rows,
-        )
-        after = conn.execute("SELECT COUNT(*) FROM articles").fetchone()[0]
-        return after - before
+# --- helper: normalize published_at to timestamptz strings for Postgres
+def normalize_ts(s: str) -> str:
+    """
+    Convert 'YYYY-MM-DD' or empty -> ISO8601 UTC string.
+    If empty/missing, default to today's date at 00:00:00Z to satisfy NOT NULL.
+    """
+    try:
+        s = (s or "").strip()
+        if not s:
+            dt = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+            return dt.isoformat()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", s):
+            dt = datetime.strptime(s, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+            return dt.isoformat()
+        # fallback: try parsing anything else
+        dt = pd.to_datetime(s, utc=True, errors="coerce")
+        if pd.isna(dt):
+            dt = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        return dt.to_pydatetime().isoformat()
+    except Exception:
+        dt = datetime.now(timezone.utc).replace(hour=0, minute=0, second=0, microsecond=0)
+        return dt.isoformat()
+
+def upsert_articles(df: pd.DataFrame) -> int:
+    """
+    Inserts rows into articles with dedupe on (url).
+    Counts inserted rows by before/after like your original behavior.
+    """
+    engine = get_engine()
+    # pre-count
+    with engine.connect() as c:
+        before = c.execute(text("SELECT COUNT(*) FROM articles")).scalar()
+
+    rows = [
+        {
+            "ticker": r.ticker,
+            "headline": r.headline,
+            "url": r.url,
+            "published_at": normalize_ts(r.published_at),
+            "source": r.source,
+            "text": r.text,
+        }
+        for r in df.itertuples(index=False)
+    ]
+
+    ins_sql = text("""
+        INSERT INTO articles (ticker, headline, url, published_at, source, text)
+        VALUES (:ticker, :headline, :url, :published_at, :source, :text)
+        ON CONFLICT (url) DO NOTHING
+    """)
+
+    # executemany (driver runs once per dict)
+    with engine.begin() as c:
+        c.execute(ins_sql, rows)
+
+    with engine.connect() as c:
+        after = c.execute(text("SELECT COUNT(*) FROM articles")).scalar()
+
+    return (after - before)
 
 def main(debug=True, save_csv=True):
     tickers = load_watchlist()
@@ -388,14 +411,16 @@ def main(debug=True, save_csv=True):
     inserted = upsert_articles(df)
     print(f"DB UPSERT: inserted {inserted} new rows into 'articles'.")
 
-    with sqlite3.connect(DB_PATH) as conn:
-        sample = conn.execute(
-            "SELECT id, ticker, substr(headline,1,80) AS h, source, published_at "
+    # sample preview (Postgres)
+    engine = get_engine()
+    with engine.connect() as c:
+        sample = list(c.execute(text(
+            "SELECT id, ticker, substring(headline from 1 for 80) AS h, source, published_at "
             "FROM articles ORDER BY id DESC LIMIT 6"
-        ).fetchall()
+        )))
     print("Newest rows:")
     for row in sample:
-        print(" ", row)
+        print(" ", tuple(row))
 
 if __name__ == "__main__":
     main(debug=True, save_csv=True)
