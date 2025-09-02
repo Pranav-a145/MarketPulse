@@ -1,28 +1,26 @@
-
+# api/app.py  — Postgres + SQLAlchemy version
 from typing import List, Optional
-from pathlib import Path
 from datetime import datetime
-import sqlite3
 
 from fastapi import FastAPI, Query, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
+from sqlalchemy import text
+from db.conn import get_engine  # uses DATABASE_URL env var
 from scripts.retriever import Retriever
-
-DB_PATH = "marketpulse.db"
 
 app = FastAPI(title="MarketPulse API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],  # tighten later
+    allow_origins=["*"],   # tighten later
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-
+# ---- Models ----
 class Headline(BaseModel):
     article_id: int
     ticker: str
@@ -64,17 +62,9 @@ class SummarizeRequest(BaseModel):
 class SummarizeResponse(BaseModel):
     summary: str
 
-
-def _connect() -> sqlite3.Connection:
-    con = sqlite3.connect(DB_PATH, timeout=30)
-    con.row_factory = sqlite3.Row
-    con.execute("PRAGMA journal_mode=WAL;")
-    con.execute("PRAGMA busy_timeout=5000;")
-    return con
-
-
+# ---- Helpers ----
 def _lazy_answer_query(*, query: str, ticker: Optional[str], days: int, topk: int) -> str:
-    # Import only when needed to avoid slow app startup
+    # Import only when needed to avoid slow startup
     from scripts.rag_answer import answer_query
     return answer_query(query, ticker=ticker, days=days, topk=topk)
 
@@ -82,9 +72,7 @@ def _lazy_summarize_article(article_id: int) -> str:
     from scripts.rag_answer import summarize_article
     return summarize_article(article_id)
 
-# ------------------------
-# Routes
-# ------------------------
+# ---- Routes ----
 @app.get("/health")
 def health():
     return {"ok": True, "time": datetime.utcnow().isoformat() + "Z"}
@@ -96,12 +84,11 @@ def get_headlines(
     limit: int = Query(100, ge=1, le=1000),
 ):
     """
-    Recent articles for a ticker within the last N days. Joined with the *latest* sentiment row.
-    The UI can color rows by max(p_neg, p_neu, p_pos).
+    Recent articles for a ticker within the last N days. Joined with the *latest* sentiment row per article.
+    Works whether published_at is stored as TEXT 'YYYY-MM-DD' or as DATE.
     """
-    with _connect() as con:
-        # Correct latest-per-article sentiment join
-        sql = """
+    eng = get_engine()
+    sql = text("""
         WITH latest AS (
           SELECT article_id, MAX(created_at) AS created_at
           FROM sentiment
@@ -124,12 +111,26 @@ def get_headlines(
         LEFT JOIN sentiment s
           ON s.article_id = ls.article_id
          AND s.created_at = ls.created_at
-        WHERE a.ticker = ?
-          AND date(a.published_at) >= date('now', ?)
+        WHERE a.ticker = :ticker
+          AND COALESCE(
+                CASE
+                  WHEN a.published_at IS NULL OR a.published_at = '' THEN NULL
+                  ELSE to_date(a.published_at, 'YYYY-MM-DD')
+                END,
+                -- if it's already a date, this CASE will be NULL; fallback to cast
+                NULLIF(a.published_at::text, '')
+              ) >= (CURRENT_DATE - (:days || ' days')::interval)
         ORDER BY a.published_at DESC, a.id DESC
-        LIMIT ?
-        """
-        rows = con.execute(sql, (ticker.upper(), f"-{days} day", limit)).fetchall()
+        LIMIT :limit
+    """)
+    # Note: above WHERE handles TEXT date; if your column is DATE already, it still works.
+
+    with eng.connect() as c:
+        rows = c.execute(sql, {
+            "ticker": ticker.upper(),
+            "days": int(days),
+            "limit": int(limit),
+        }).mappings().all()
 
     return [
         Headline(
@@ -138,7 +139,7 @@ def get_headlines(
             headline=r["headline"],
             url=r["url"],
             source=r["source"],
-            published_at=r["published_at"],
+            published_at=str(r["published_at"]) if r["published_at"] is not None else None,
             sentiment_label=r["sentiment_label"],
             p_neg=r["p_neg"],
             p_neu=r["p_neu"],
@@ -150,8 +151,7 @@ def get_headlines(
 @app.post("/ask", response_model=AskResponse)
 def ask(req: AskRequest):
     """
-    Run sentiment-aware retrieval + RAG answer.
-    Returns both the answer (text with numbered citations) and the top hits (for UI linking).
+    Sentiment-aware retrieval + RAG answer.
     """
     r = Retriever()
     hits = r.search(
@@ -183,7 +183,7 @@ def summarize(req: SummarizeRequest):
     """
     Summarize a single article (used by the 'Summarize' button next to a headline).
     """
-    text = _lazy_summarize_article(req.article_id)
-    if not text:
+    text_out = _lazy_summarize_article(req.article_id)
+    if not text_out:
         raise HTTPException(status_code=404, detail="No summary available.")
-    return SummarizeResponse(summary=text)
+    return SummarizeResponse(summary=text_out)
