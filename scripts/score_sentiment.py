@@ -1,3 +1,4 @@
+# scripts/score_sentiment.py — Postgres + HF-hosted model (no logic changes to scoring)
 import os
 from datetime import datetime, timezone
 from typing import List, Tuple
@@ -6,16 +7,19 @@ import torch
 import pandas as pd
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
-# NEW: Postgres via SQLAlchemy
+# Postgres via SQLAlchemy
 from sqlalchemy import text
 from db.conn import get_engine
 
-MODEL_DIR = "models/my_sentiment_model"   # unchanged (local for now)
+# ---------------- Config ----------------
+# Use your hosted HF repo; can be overridden by env SENTIMENT_MODEL_REPO
+MODEL_REPO = os.getenv("SENTIMENT_MODEL_REPO", "pranava145/my_sentiment_model")
+
 USE_ARTICLE_TEXT_IF_AVAILABLE = True
 MIN_TEXT_CHARS = 120
 LOOKBACK_DAYS = None          # e.g., 7 to limit by recency; None = all unscored
 MAX_TO_SCORE = 5000
-BATCH_SIZE = 32               # you were batching; set a sane default
+BATCH_SIZE = 32
 
 def connect_db():
     """Return an SQLAlchemy engine connected via DATABASE_URL."""
@@ -39,7 +43,7 @@ def fetch_unscored_articles(engine) -> List[Tuple]:
         base_sql += " AND a.published_at >= (now() - (:days || ' days')::interval) "
         params["days"] = str(int(LOOKBACK_DAYS))
 
-    base_sql += " ORDER BY a.published_at DESC, a.id DESC LIMIT :limit "
+    base_sql += " ORDER BY a.published_at DESC NULLS LAST, a.id DESC LIMIT :limit "
     params["limit"] = int(MAX_TO_SCORE)
 
     with engine.connect() as c:
@@ -47,8 +51,26 @@ def fetch_unscored_articles(engine) -> List[Tuple]:
     return rows
 
 def load_model():
-    tokenizer = AutoTokenizer.from_pretrained(MODEL_DIR)
-    model = AutoModelForSequenceClassification.from_pretrained(MODEL_DIR)
+    """
+    Load the sentiment model from a (private) Hugging Face repo.
+    Auth order:
+      1) env HF_TOKEN or HUGGINGFACE_HUB_TOKEN
+      2) cached login from `huggingface-cli login` (dev only)
+    """
+    hf_token = (
+        os.getenv("HF_TOKEN")
+        or os.getenv("HUGGINGFACE_HUB_TOKEN")
+        or None
+    )
+
+    # Transformers >=4.36 supports token= ; older uses use_auth_token=
+    try:
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_REPO, token=hf_token)
+        model = AutoModelForSequenceClassification.from_pretrained(MODEL_REPO, token=hf_token)
+    except TypeError:
+        tokenizer = AutoTokenizer.from_pretrained(MODEL_REPO, use_auth_token=hf_token)
+        model = AutoModelForSequenceClassification.from_pretrained(MODEL_REPO, use_auth_token=hf_token)
+
     model.eval()
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
     model.to(device)
@@ -155,6 +177,7 @@ def main():
 
     now = datetime.now(timezone.utc).strftime("%Y%m%d_%H%M%S")
     out_path = f"data/sentiment_scores_{now}.csv"
+    os.makedirs("data", exist_ok=True)
     df_out = pd.DataFrame({
         "article_id": article_ids,
         "ticker": tickers,
@@ -179,7 +202,6 @@ def main():
     )
     print("\nSummary (newly scored):")
     print(summary)
-
     print("Done.")
 
 if __name__ == "__main__":
