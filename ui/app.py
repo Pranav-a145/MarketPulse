@@ -6,6 +6,14 @@ import requests
 import pandas as pd
 import streamlit as st
 
+
+import streamlit as st
+if "OPENAI_API_KEY" in st.secrets:
+    os.environ["OPENAI_API_KEY"] = st.secrets["OPENAI_API_KEY"]
+if "DATABASE_URL" in st.secrets:
+    os.environ["DATABASE_URL"] = st.secrets["DATABASE_URL"]
+
+
 API_BASE = os.getenv("MP_API_BASE", "http://127.0.0.1:8000")
 WATCHLIST_PATH = Path("data/watchlist.txt")
 
