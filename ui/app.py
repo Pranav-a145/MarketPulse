@@ -14,7 +14,11 @@ if "DATABASE_URL" in st.secrets:
     os.environ["DATABASE_URL"] = st.secrets["DATABASE_URL"]
 
 
-API_BASE = os.getenv("MP_API_BASE", "http://127.0.0.1:8000")
+API_BASE = (
+    st.secrets.get("MP_API_BASE")
+    if "MP_API_BASE" in st.secrets
+    else os.getenv("MP_API_BASE", "https://marketpulse-6qis.onrender.com")
+)
 WATCHLIST_PATH = Path("data/watchlist.txt")
 
 # --------------------------
