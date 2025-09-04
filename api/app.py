@@ -89,40 +89,37 @@ def get_headlines(
     """
     eng = get_engine()
     sql = text("""
-        WITH latest AS (
-          SELECT article_id, MAX(created_at) AS created_at
-          FROM sentiment
-          GROUP BY article_id
-        )
-        SELECT
-          a.id AS article_id,
-          a.ticker,
-          a.headline,
-          a.url,
-          a.source,
-          a.published_at,
-          s.label AS sentiment_label,
-          s.p_neg,
-          s.p_neu,
-          s.p_pos
-        FROM articles a
-        LEFT JOIN latest ls
-          ON ls.article_id = a.id
-        LEFT JOIN sentiment s
-          ON s.article_id = ls.article_id
-         AND s.created_at = ls.created_at
-        WHERE a.ticker = :ticker
-          AND COALESCE(
-                CASE
-                  WHEN a.published_at IS NULL OR a.published_at = '' THEN NULL
-                  ELSE to_date(a.published_at, 'YYYY-MM-DD')
-                END,
-                -- if it's already a date, this CASE will be NULL; fallback to cast
-                NULLIF(a.published_at::text, '')
-              ) >= (CURRENT_DATE - (:days || ' days')::interval)
-        ORDER BY a.published_at DESC, a.id DESC
-        LIMIT :limit
-    """)
+    WITH latest AS (
+      SELECT article_id, MAX(created_at) AS created_at
+      FROM sentiment
+      GROUP BY article_id
+    )
+    SELECT
+      a.id AS article_id,
+      a.ticker,
+      a.headline,
+      a.url,
+      a.source,
+      a.published_at,
+      s.label AS sentiment_label,
+      s.p_neg,
+      s.p_neu,
+      s.p_pos
+    FROM articles a
+    LEFT JOIN latest ls
+      ON ls.article_id = a.id
+    LEFT JOIN sentiment s
+      ON s.article_id = ls.article_id
+     AND s.created_at = ls.created_at
+    WHERE a.ticker = :ticker
+      -- Convert to text, drop empty strings, then cast to DATE for filtering
+      AND NULLIF(a.published_at::text, '')::date >= (CURRENT_DATE - (:days || ' days')::interval)
+    -- Order by a safe timestamp: empty -> epoch
+    ORDER BY COALESCE(NULLIF(a.published_at::text, '')::timestamp, TIMESTAMP 'epoch') DESC,
+             a.id DESC
+    LIMIT :limit
+""")
+
     # Note: above WHERE handles TEXT date; if your column is DATE already, it still works.
 
     with eng.connect() as c:
