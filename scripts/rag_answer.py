@@ -6,6 +6,7 @@ import textwrap
 import hashlib
 import requests
 from urllib.parse import urlparse, urlunparse
+from datetime import datetime
 
 # DB: Postgres via SQLAlchemy
 from sqlalchemy import text
@@ -24,7 +25,8 @@ if not OPENAI_API_KEY:
 OPENAI_MODEL = "gpt-4o-mini"
 OPENAI_URL = "https://api.openai.com/v1/responses"
 API_TIMEOUT = 30
-MAX_OUTPUT_TOKENS_BULLETS = 500  # unchanged
+MAX_OUTPUT_TOKENS_BULLETS = 500
+MAX_OUTPUT_TOKENS_SUMMARY = 400  # FIX: define missing constant
 
 MAX_SOURCES = 5
 CHUNKS_PER_ARTICLE = 3
@@ -32,8 +34,6 @@ TARGET_WORDS = (180, 220)
 
 SUM_CHUNKS_PER_ARTICLE = 8
 SUMMARY_PROMPT_VERSION = "v1"
-# NOTE: your original file references MAX_OUTPUT_TOKENS_SUMMARY later.
-# I am not defining it here because you asked for DB-only changes.
 
 # ---------- cache tables (Postgres) ----------
 def _ensure_cache_tables(engine):
@@ -75,6 +75,20 @@ def _canonical_url(u: str) -> str:
 
 def _word_count(s: str) -> int:
     return len(re.findall(r"\b\w+\b", s or ""))
+
+def _safe_date_to_string(date_obj) -> str:
+    """Convert datetime-like inputs to YYYY-MM-DD or 'n/a'."""
+    if date_obj is None:
+        return "n/a"
+    if isinstance(date_obj, datetime):
+        return date_obj.strftime("%Y-%m-%d")
+    # Some ORMs may return date/datetime-like types; use best-effort string
+    try:
+        if hasattr(date_obj, "strftime"):
+            return date_obj.strftime("%Y-%m-%d")
+    except Exception:
+        pass
+    return str(date_obj)
 
 def _get_joined_snippet(engine, article_id: int, limit: int) -> str:
     sql = text("""
@@ -155,7 +169,7 @@ def _format_sources_for_prompt(items: List[Dict[str, Any]]) -> str:
     blocks = []
     for i, h in enumerate(items, 1):
         u = _canonical_url(h.get("url") or "")
-        date = (h.get("published_at") or "").strip() or "n/a"
+        date = _safe_date_to_string(h.get("published_at"))
         src = (h.get("source") or "").strip() or urlparse(u).netloc
         head = (h.get("headline") or "").strip()
         ev = (h.get("_evidence") or "").strip()
@@ -166,7 +180,7 @@ def _build_public_sources_list(items: List[Dict[str, Any]]) -> str:
     lines = []
     for i, h in enumerate(items, 1):
         u = _canonical_url(h.get("url") or "")
-        date = (h.get("published_at") or "").strip() or "n/a"
+        date = _safe_date_to_string(h.get("published_at"))
         head = (h.get("headline") or "").strip()
         lines.append(f"[{i}] {head} - {date} - {u}")
     return "\n".join(lines)
@@ -259,7 +273,6 @@ def _enforce_numbers_from_evidence(bullets_text: str, evidence_text: str) -> str
 
 def _openai_respond(prompt: str, *, max_output_tokens: int) -> str:
     headers = {
-        # NOTE: use your OPENAI_API_KEY env var
         "Authorization": f"Bearer {OPENAI_API_KEY}",
         "Content-Type": "application/json",
     }
@@ -373,7 +386,11 @@ def answer_query(query: str, ticker: Optional[str], days: int = 7, topk: int = 5
     if debug:
         print("\n[DEBUG] Using sources:")
         for i, h in enumerate(top, 1):
-            print(f" {i}. {h['published_at']} | {h['source']} | {h['headline']}")
+            # Use safe conversion for dates in debug output too
+            dbg_date = _safe_date_to_string(h.get("published_at"))
+            dbg_src = (h.get("source") or "")
+            dbg_head = (h.get("headline") or "")
+            print(f" {i}. {dbg_date} | {dbg_src} | {dbg_head}")
         print("\n[DEBUG] Prompt preview:")
         print(textwrap.shorten(prompt, width=500, placeholder=" ..."))
 
@@ -399,7 +416,7 @@ def answer_query(query: str, ticker: Optional[str], days: int = 7, topk: int = 5
         fallback_lines = []
         for i, h in enumerate(top, 1):
             head = (h.get("headline") or "").strip()
-            date = (h.get("published_at") or "n/a").strip()
+            date = _safe_date_to_string(h.get("published_at"))
             ev = h.get("_evidence") or head
             sent = textwrap.shorten(ev, width=200, placeholder="...")
             fallback_lines.append(f"- {date} - {head}. {sent} [{i}]")
@@ -440,9 +457,7 @@ def summarize_article(article_id: int, debug: bool = False) -> str:
 
     headline = (row["headline"] or "").strip()
     url = _canonical_url(row["url"] or "")
-    date = (row["published_at"] or "n/a")
-    if hasattr(date, "isoformat"):
-        date = date.strftime("%Y-%m-%d")
+    date = _safe_date_to_string(row.get("published_at"))
     src = (row["source"] or "").strip() or urlparse(url).netloc
     body_parts = [headline] + [((c[0] or "").replace("\n", " ").strip()) for c in chunks]
     content = re.sub(r"\s+", " ", " ".join([p for p in body_parts if p])).strip()
@@ -461,8 +476,7 @@ def summarize_article(article_id: int, debug: bool = False) -> str:
             print("[DEBUG] Summary prompt preview:")
             print(textwrap.shorten(prompt, width=500, placeholder=" ..."))
         try:
-            # NOTE: your original code uses MAX_OUTPUT_TOKENS_SUMMARY here.
-            summary = _openai_respond(prompt, max_output_tokens=MAX_OUTPUT_TOKENS_SUMMARY)  # noqa: F821
+            summary = _openai_respond(prompt, max_output_tokens=MAX_OUTPUT_TOKENS_SUMMARY)
             if not summary.strip():
                 if debug:
                     print("[DEBUG] Empty model response on summarize; using extractive fallback")
