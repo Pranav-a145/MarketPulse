@@ -69,6 +69,14 @@ def _intent_from_query(q: str) -> str:
         return "pos"
     return "neutral"
 
+def _safe_date_to_string(date_obj) -> str:
+    """Convert datetime object to string safely"""
+    if date_obj is None:
+        return ""
+    if isinstance(date_obj, datetime):
+        return date_obj.strftime("%Y-%m-%d")
+    return str(date_obj)
+
 class Retriever:
     def __init__(self, model_name: str = MODEL_NAME):
         self.model = SentenceTransformer(model_name)
@@ -202,7 +210,7 @@ class Retriever:
                     "headline": r["headline"],
                     "url": r["url"],
                     "source": r["source"],
-                    "published_at": r["published_at"],
+                    "published_at": _safe_date_to_string(r["published_at"]),  # FIXED: Convert datetime to string
                     "article_id": aid,
                 }
 
