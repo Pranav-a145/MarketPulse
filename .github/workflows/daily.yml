@@ -3,7 +3,6 @@ name: Daily MarketPulse Pipeline
 on:
   workflow_dispatch: {}
   schedule:
-    # Run every day at 13:00 UTC (adjust if you want)
     - cron: "0 13 * * *"
 
 jobs:
@@ -11,13 +10,10 @@ jobs:
     runs-on: ubuntu-latest
 
     env:
-      # Passed from GitHub → Settings → Secrets and variables → Actions → New repository secret
       DATABASE_URL: ${{ secrets.DATABASE_URL }}
       OPENAI_API_KEY: ${{ secrets.OPENAI_API_KEY }}
       HF_TOKEN: ${{ secrets.HF_TOKEN }}
       SENTIMENT_MODEL_REPO: ${{ secrets.SENTIMENT_MODEL_REPO }}
-      # Streamlit uses this file in the app, but our runner reads env directly.
-      # (No need to mount secrets.toml here.)
 
     steps:
       - name: Checkout
