@@ -3,14 +3,13 @@ from pathlib import Path
 from datetime import datetime, timedelta
 import trafilatura
 
-# NEW: Postgres via SQLAlchemy
 from sqlalchemy import text
 from db.conn import get_engine
 
-ALLOW_MINSIZE = 400           # min length to accept
-LOOKBACK_DAYS_DEFAULT = 14    # only look back this far
-BATCH_LIMIT_DEFAULT = 1000    # max articles per run
-SLEEP_BETWEEN = 0.25          # throttle
+ALLOW_MINSIZE = 400          
+LOOKBACK_DAYS_DEFAULT = 14    
+BATCH_LIMIT_DEFAULT = 1000    
+SLEEP_BETWEEN = 0.25         
 
 def clean_text(t: str) -> str:
     t = (t or "").strip()
@@ -71,13 +70,13 @@ def main(lookback_days=LOOKBACK_DAYS_DEFAULT, limit=BATCH_LIMIT_DEFAULT):
         elif len(txt) < ALLOW_MINSIZE:
             short += 1
         else:
-            trimmed = txt[:1500]  # keep only first ~1–3 paragraphs
+            trimmed = txt[:1500]  
             update_text(engine, aid, trimmed)
             filled += 1
 
         processed += 1
         if processed % 10 == 0:
-            # no explicit commit needed; update_text commits per row
+           
             pass
 
         time.sleep(SLEEP_BETWEEN)
