@@ -8,11 +8,9 @@ import requests
 from urllib.parse import urlparse, urlunparse
 from datetime import datetime
 
-# DB: Postgres via SQLAlchemy
 from sqlalchemy import text
 from db.conn import get_engine
 
-# Retriever (already Postgres-compatible)
 try:
     from scripts.retriever import Retriever
 except ImportError:
@@ -26,8 +24,7 @@ OPENAI_MODEL = "gpt-4o-mini"
 OPENAI_URL = "https://api.openai.com/v1/responses"
 API_TIMEOUT = 30
 MAX_OUTPUT_TOKENS_BULLETS = 500
-MAX_OUTPUT_TOKENS_SUMMARY = 400  # FIX: define missing constant
-
+MAX_OUTPUT_TOKENS_SUMMARY = 400  
 MAX_SOURCES = 5
 CHUNKS_PER_ARTICLE = 3
 TARGET_WORDS = (180, 220)
@@ -35,7 +32,6 @@ TARGET_WORDS = (180, 220)
 SUM_CHUNKS_PER_ARTICLE = 8
 SUMMARY_PROMPT_VERSION = "v1"
 
-# ---------- cache tables (Postgres) ----------
 def _ensure_cache_tables(engine):
     with engine.begin() as c:
         c.execute(text("""
@@ -82,7 +78,6 @@ def _safe_date_to_string(date_obj) -> str:
         return "n/a"
     if isinstance(date_obj, datetime):
         return date_obj.strftime("%Y-%m-%d")
-    # Some ORMs may return date/datetime-like types; use best-effort string
     try:
         if hasattr(date_obj, "strftime"):
             return date_obj.strftime("%Y-%m-%d")
@@ -386,7 +381,6 @@ def answer_query(query: str, ticker: Optional[str], days: int = 7, topk: int = 5
     if debug:
         print("\n[DEBUG] Using sources:")
         for i, h in enumerate(top, 1):
-            # Use safe conversion for dates in debug output too
             dbg_date = _safe_date_to_string(h.get("published_at"))
             dbg_src = (h.get("source") or "")
             dbg_head = (h.get("headline") or "")
