@@ -5,28 +5,23 @@ import re
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-# NEW: Postgres via SQLAlchemy
 from sqlalchemy import text
 from db.conn import get_engine
 
 MODEL_NAME = "sentence-transformers/all-MiniLM-L6-v2"
 
-# ---------------- Scoring knobs ----------------
 W_SEMANTIC = 0.80
 W_RECENCY  = 0.20
 RECENCY_HALF_LIFE_DAYS = 7.0
 SEMANTIC_MIN = 0.25
 
-# Sentiment blend
 CONF_BAND = 0.60
 NEG_WEIGHT = 0.20
 POS_WEIGHT = 0.20
 
-# Candidate caps
 DEFAULT_CANDIDATES = 3000
 DEFAULT_TOPK = 5
 
-# Intent detection
 NEG_Q = re.compile(r"\b(down|drop|fell|falling|slump|red|sell[- ]?off|plunge|decline|lower|bear|why.*down)\b", re.I)
 POS_Q = re.compile(r"\b(up|rally|rose|jump|green|surge|soar|gain|higher|bull|why.*up)\b", re.I)
 
@@ -40,7 +35,6 @@ POS_ARTICLE_HINTS = re.compile(
 )
 
 def _to_vec(blob: bytes, dim: int) -> np.ndarray:
-    # psycopg returns memoryview/bytes; ensure bytes then view as float32
     return np.frombuffer(bytes(blob), dtype=np.float32, count=dim)
 
 def _age_days(published_at) -> float:
@@ -105,7 +99,6 @@ class Retriever:
             params["ticker"] = ticker.upper()
 
         if days is not None and days > 0:
-            # Postgres interval version of date filter
             where.append("a.published_at >= (now() - (:days || ' days')::interval)")
             params["days"] = str(int(days))
 
@@ -134,7 +127,6 @@ class Retriever:
         params["limit"] = int(limit)
 
         with self.engine.connect() as c:
-            # .mappings() gives dict-like rows (so r["col"] works)
             rows = c.execute(text(sql), params).mappings().all()
         return rows
 
@@ -217,7 +209,6 @@ class Retriever:
         results = sorted(per_article.values(), key=lambda x: x["score"], reverse=True)
         return results[:topk]
 
-# ----- CLI -----
 if __name__ == "__main__":
     import argparse, textwrap
     ap = argparse.ArgumentParser(description="Sentiment-aware retriever")
