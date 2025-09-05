@@ -1,4 +1,3 @@
-# scripts/score_sentiment.py — Postgres + HF-hosted model (no logic changes to scoring)
 import os
 from datetime import datetime, timezone
 from typing import List, Tuple
@@ -7,17 +6,14 @@ import torch
 import pandas as pd
 from transformers import AutoTokenizer, AutoModelForSequenceClassification
 
-# Postgres via SQLAlchemy
 from sqlalchemy import text
 from db.conn import get_engine
 
-# ---------------- Config ----------------
-# Use your hosted HF repo; can be overridden by env SENTIMENT_MODEL_REPO
 MODEL_REPO = os.getenv("SENTIMENT_MODEL_REPO", "pranava145/my_sentiment_model")
 
 USE_ARTICLE_TEXT_IF_AVAILABLE = True
 MIN_TEXT_CHARS = 120
-LOOKBACK_DAYS = None          # e.g., 7 to limit by recency; None = all unscored
+LOOKBACK_DAYS = None          
 MAX_TO_SCORE = 5000
 BATCH_SIZE = 32
 
@@ -39,7 +35,6 @@ def fetch_unscored_articles(engine) -> List[Tuple]:
     params = {}
 
     if LOOKBACK_DAYS is not None:
-        # Filter: a.published_at >= now() - interval '<days> days'
         base_sql += " AND a.published_at >= (now() - (:days || ' days')::interval) "
         params["days"] = str(int(LOOKBACK_DAYS))
 
@@ -63,7 +58,6 @@ def load_model():
         or None
     )
 
-    # Transformers >=4.36 supports token= ; older uses use_auth_token=
     try:
         tokenizer = AutoTokenizer.from_pretrained(MODEL_REPO, token=hf_token)
         model = AutoModelForSequenceClassification.from_pretrained(MODEL_REPO, token=hf_token)
