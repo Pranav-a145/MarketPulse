@@ -1,4 +1,3 @@
-# api/app.py  — Postgres + SQLAlchemy version
 from typing import List, Optional
 from datetime import datetime
 import logging
@@ -8,9 +7,7 @@ from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 
 from sqlalchemy import text
-from db.conn import get_engine  # uses DATABASE_URL env var
-
-# Set up logging
+from db.conn import get_engine  
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
@@ -18,13 +15,12 @@ app = FastAPI(title="MarketPulse API", version="0.1.0")
 
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],   # tighten later
+    allow_origins=["*"],   
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
 
-# ---- Models ----
 class Headline(BaseModel):
     article_id: int
     ticker: str
@@ -66,9 +62,7 @@ class SummarizeRequest(BaseModel):
 class SummarizeResponse(BaseModel):
     summary: str
 
-# ---- Helpers ----
 def _lazy_answer_query(*, query: str, ticker: Optional[str], days: int, topk: int) -> str:
-    # Import only when needed to avoid slow startup
     try:
         from scripts.rag_answer import answer_query
         return answer_query(query, ticker=ticker, days=days, topk=topk)
@@ -90,7 +84,6 @@ def _lazy_summarize_article(article_id: int) -> str:
         logger.error(f"Error in summarize_article: {e}")
         return f"An error occurred while summarizing: {str(e)}"
 
-# ---- Routes ----
 @app.get("/")
 def root():
     return {"message": "MarketPulse API is running", "docs": "/docs"}
@@ -98,7 +91,6 @@ def root():
 @app.get("/health")
 def health():
     try:
-        # Test database connection
         eng = get_engine()
         with eng.connect() as c:
             c.execute(text("SELECT 1"))
@@ -197,7 +189,6 @@ def ask(req: AskRequest):
     Sentiment-aware retrieval + RAG answer.
     """
     try:
-        # Try to import and use Retriever
         try:
             from scripts.retriever import Retriever
             r = Retriever()
@@ -206,13 +197,11 @@ def ask(req: AskRequest):
             )
         except ImportError as e:
             logger.error(f"Failed to import Retriever: {e}")
-            # Return empty hits if retriever is not available
             hits = []
         except Exception as e:
             logger.error(f"Error in retrieval: {e}")
             hits = []
 
-        # Generate answer
         answer = _lazy_answer_query(query=req.query, ticker=req.ticker, days=req.days, topk=req.topk)
 
         hits_out = [
@@ -235,7 +224,6 @@ def ask(req: AskRequest):
     
     except Exception as e:
         logger.error(f"Error in ask endpoint: {e}")
-        # Return a graceful error response instead of 500
         return AskResponse(
             answer=f"I apologize, but I encountered an error while processing your question: {req.query}. Please try again later.",
             hits=[]
@@ -258,13 +246,11 @@ def summarize(req: SummarizeRequest):
         logger.error(f"Error in summarize endpoint: {e}")
         raise HTTPException(status_code=500, detail=f"Error generating summary: {str(e)}")
 
-# Add error handler for uncaught exceptions
 @app.exception_handler(500)
 async def internal_error_handler(request, exc):
     logger.error(f"Internal server error: {exc}")
     return {"error": "Internal server error", "detail": str(exc)}
 
-# Optional: Add a simple test endpoint to verify the API is working
 @app.get("/test")
 def test():
     return {"message": "API is working", "timestamp": datetime.utcnow().isoformat()}
