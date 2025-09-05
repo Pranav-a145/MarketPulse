@@ -10,7 +10,6 @@ from urllib3.util.retry import Retry
 import feedparser
 import pandas as pd
 
-# NEW: use SQLAlchemy + your shared connector
 from sqlalchemy import text
 from db.conn import get_engine
 
