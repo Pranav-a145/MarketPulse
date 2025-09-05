@@ -6,7 +6,6 @@ from typing import List, Tuple
 import numpy as np
 from sentence_transformers import SentenceTransformer
 
-# NEW: Postgres via SQLAlchemy
 from sqlalchemy import text
 from db.conn import get_engine
 
